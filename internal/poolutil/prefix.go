@@ -34,6 +34,11 @@ const (
 	defaultAllocationPrefixLength = 64
 )
 
+// ErrNoPrefixAvailable is returned by [FindFreePrefix] when the pool has no
+// prefix left to allocate. Callers can use errors.Is to distinguish
+// exhaustion from other allocation failures.
+var ErrNoPrefixAvailable = errors.New("no prefix available")
+
 // EffectiveAllocationPrefixLength returns the configured allocation prefix length
 // or the default value when the field is not explicitly set.
 func EffectiveAllocationPrefixLength(allocationPrefixLength int) int {
@@ -84,7 +89,7 @@ func FindFreePrefix(poolConfig *PrefixPoolConfig, inUseIPSet *netipx.IPSet) (net
 		}
 	}
 
-	return netip.Prefix{}, errors.New("no prefix available")
+	return netip.Prefix{}, ErrNoPrefixAvailable
 }
 
 // PrefixCandidateCount returns the count of allocatable prefixes from the pool configuration.

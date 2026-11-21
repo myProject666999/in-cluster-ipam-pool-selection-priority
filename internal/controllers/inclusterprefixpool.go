@@ -33,13 +33,14 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 
 	"sigs.k8s.io/cluster-api-ipam-provider-in-cluster/api/v1alpha2"
+	"sigs.k8s.io/cluster-api-ipam-provider-in-cluster/internal/poolselect"
 	"sigs.k8s.io/cluster-api-ipam-provider-in-cluster/internal/poolutil"
 	pooltypes "sigs.k8s.io/cluster-api-ipam-provider-in-cluster/pkg/types"
 )
 
 const (
-	inClusterPrefixPoolKind       = "InClusterPrefixPool"
-	globalInClusterPrefixPoolKind = "GlobalInClusterPrefixPool"
+	inClusterPrefixPoolKind       = poolselect.KindInClusterPrefixPool
+	globalInClusterPrefixPoolKind = poolselect.KindGlobalInClusterPrefixPool
 )
 
 // InClusterPrefixPoolReconciler reconciles an InClusterPrefixPool object.

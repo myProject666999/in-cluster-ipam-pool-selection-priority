@@ -34,6 +34,7 @@ import (
 
 	"sigs.k8s.io/cluster-api-ipam-provider-in-cluster/api/v1alpha2"
 	"sigs.k8s.io/cluster-api-ipam-provider-in-cluster/internal/index"
+	"sigs.k8s.io/cluster-api-ipam-provider-in-cluster/internal/poolselect"
 	"sigs.k8s.io/cluster-api-ipam-provider-in-cluster/internal/poolutil"
 	"sigs.k8s.io/cluster-api-ipam-provider-in-cluster/pkg/ipamutil"
 	pooltypes "sigs.k8s.io/cluster-api-ipam-provider-in-cluster/pkg/types"
@@ -61,6 +62,12 @@ type IPAddressClaimHandler struct {
 	client.Client
 	claim *ipamv1.IPAddressClaim
 	pool  genericInClusterPool
+	// poolRef is the effective reference to the selected pool. For a selector
+	// reference it names the pool that was chosen, not the selector marker.
+	poolRef ipamv1.IPPoolReference
+	// selectionErr is the classified failure from resolving the pool
+	// reference, if any. It is reported on the claim's status.
+	selectionErr error
 }
 
 var _ ipamutil.ClaimHandler = &IPAddressClaimHandler{}
@@ -96,37 +103,42 @@ func (i *InClusterProviderAdapter) ipPoolToIPClaims(kind string) func(context.Co
 	}
 }
 
-// FetchPool fetches the (Global)InClusterIPPool.
+// FetchPool resolves the pool for the claim according to the pool selection
+// rules (see [poolselect]) and stores it on the handler.
 func (h *IPAddressClaimHandler) FetchPool(ctx context.Context) (client.Object, *ctrl.Result, error) {
 	log := ctrl.LoggerFrom(ctx)
 
-	switch h.claim.Spec.PoolRef.Kind {
-	case inClusterIPPoolKind:
-		pool := &v1alpha2.InClusterIPPool{}
-		if err := h.Get(ctx, types.NamespacedName{Namespace: h.claim.Namespace, Name: h.claim.Spec.PoolRef.Name}, pool); err != nil {
-			return nil, nil, fmt.Errorf("failed to fetch pool: %w", err)
+	selection, err := resolvePool(ctx, h.Client, h.claim, poolselect.FamilyAddress)
+	if err != nil {
+		h.selectionErr = err
+		// Every classified selection failure is reported on the claim status
+		// rather than retried in a tight loop: the reference, the labels or the
+		// pools have to change before the outcome can change.
+		var selectionErr *poolselect.Error
+		if errors.As(err, &selectionErr) {
+			log.Error(err, "the claim's pool could not be selected")
+			return nil, nil, nil
 		}
-		h.pool = pool
-	case globalInClusterIPPoolKind:
-		pool := &v1alpha2.GlobalInClusterIPPool{}
-		if err := h.Get(ctx, types.NamespacedName{Name: h.claim.Spec.PoolRef.Name}, pool); err != nil {
-			return nil, nil, fmt.Errorf("failed to fetch pool: %w", err)
-		}
-		h.pool = pool
+		return nil, nil, err
 	}
 
-	if h.pool == nil {
-		err := errors.New("pool not found")
-		log.Error(err, "the referenced pool could not be found")
-		return nil, nil, nil
+	pool, ok := selection.Object.(genericInClusterPool)
+	if !ok {
+		return nil, nil, fmt.Errorf("selected pool %T is not an address pool", selection.Object)
 	}
 
+	h.pool = pool
+	h.poolRef = ipamv1.IPPoolReference{
+		APIGroup: v1alpha2.GroupVersion.Group,
+		Kind:     selection.Reference.Kind.Name,
+		Name:     selection.Reference.Name,
+	}
 	return h.pool, nil, nil
 }
 
 // EnsureAddress ensures that the IPAddress contains a valid address.
 func (h *IPAddressClaimHandler) EnsureAddress(ctx context.Context, address *ipamv1.IPAddress) (*ctrl.Result, error) {
-	addressesInUse, err := poolutil.ListAddressesInUse(ctx, h.Client, h.pool.GetNamespace(), h.claim.Spec.PoolRef)
+	addressesInUse, err := poolutil.ListAddressesInUse(ctx, h.Client, h.pool.GetNamespace(), h.poolRef)
 	if err != nil {
 		return nil, fmt.Errorf("failed to list addresses: %w", err)
 	}
@@ -149,6 +161,17 @@ func (h *IPAddressClaimHandler) EnsureAddress(ctx context.Context, address *ipam
 
 		freeIP, err := poolutil.FindFreeAddress(poolIPSet, inUseIPSet)
 		if err != nil {
+			if errors.Is(err, poolutil.ErrNoAddressAvailable) {
+				// The pool was selected and is exhausted. Report that instead of
+				// moving on to another pool: switching pools would place the
+				// address in a network range the reference did not ask for.
+				h.selectionErr = &poolselect.Error{
+					Kind:    poolselect.ErrPoolExhausted,
+					Message: fmt.Sprintf("selected pool %s %q has no free address", h.pool.GetObjectKind().GroupVersionKind().Kind, h.pool.GetName()),
+					Cause:   err,
+				}
+				return nil, h.selectionErr
+			}
 			return nil, fmt.Errorf("failed to find free address: %w", err)
 		}
 
@@ -192,6 +215,11 @@ func (h *IPAddressClaimHandler) ReleaseAddress(ctx context.Context) (*ctrl.Resul
 	}
 
 	return nil, nil
+}
+
+// SelectionError reports the classified pool selection failure, if any.
+func (h *IPAddressClaimHandler) SelectionError() (string, string) {
+	return selectionErrorReason(h.selectionErr)
 }
 
 func buildAddressList(addressesInUse []ipamv1.IPAddress, gateway string) []string {

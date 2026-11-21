@@ -33,6 +33,7 @@ import (
 
 	"sigs.k8s.io/cluster-api-ipam-provider-in-cluster/api/v1alpha2"
 	"sigs.k8s.io/cluster-api-ipam-provider-in-cluster/internal/index"
+	"sigs.k8s.io/cluster-api-ipam-provider-in-cluster/internal/poolselect"
 	"sigs.k8s.io/cluster-api-ipam-provider-in-cluster/internal/poolutil"
 	"sigs.k8s.io/cluster-api-ipam-provider-in-cluster/pkg/ipamutil"
 	pooltypes "sigs.k8s.io/cluster-api-ipam-provider-in-cluster/pkg/types"
@@ -43,6 +44,12 @@ type PrefixIPAddressClaimHandler struct {
 	client.Client
 	claim *ipamv1.IPAddressClaim
 	pool  pooltypes.GenericInClusterPrefixPool
+	// poolRef is the effective reference to the selected pool. For a selector
+	// reference it names the pool that was chosen, not the selector marker.
+	poolRef ipamv1.IPPoolReference
+	// selectionErr is the classified failure from resolving the pool
+	// reference, if any. It is reported on the claim's status.
+	selectionErr error
 }
 
 var _ ipamutil.ClaimHandler = &PrefixIPAddressClaimHandler{}
@@ -80,35 +87,39 @@ func (i *InClusterProviderAdapter) prefixPoolToIPClaims(kind string) func(contex
 	}
 }
 
-// FetchPool fetches the (Global)InClusterPrefixPool.
+// FetchPool resolves the prefix pool for the claim according to the pool
+// selection rules (see [poolselect]) and stores it on the handler.
 func (h *PrefixIPAddressClaimHandler) FetchPool(ctx context.Context) (client.Object, *ctrl.Result, error) {
-	switch h.claim.Spec.PoolRef.Kind {
-	case inClusterPrefixPoolKind:
-		pool := &v1alpha2.InClusterPrefixPool{}
-		if err := h.Get(ctx, types.NamespacedName{Namespace: h.claim.Namespace, Name: h.claim.Spec.PoolRef.Name}, pool); err != nil {
-			return nil, nil, fmt.Errorf("failed to fetch pool: %w", err)
+	log := ctrl.LoggerFrom(ctx)
+
+	selection, err := resolvePool(ctx, h.Client, h.claim, poolselect.FamilyPrefix)
+	if err != nil {
+		h.selectionErr = err
+		var selectionErr *poolselect.Error
+		if errors.As(err, &selectionErr) {
+			log.Error(err, "the claim's pool could not be selected")
+			return nil, nil, nil
 		}
-		h.pool = pool
-	case globalInClusterPrefixPoolKind:
-		pool := &v1alpha2.GlobalInClusterPrefixPool{}
-		if err := h.Get(ctx, types.NamespacedName{Name: h.claim.Spec.PoolRef.Name}, pool); err != nil {
-			return nil, nil, fmt.Errorf("failed to fetch pool: %w", err)
-		}
-		h.pool = pool
+		return nil, nil, err
 	}
 
-	if h.pool == nil {
-		err := errors.New("pool not found")
-		ctrl.LoggerFrom(ctx).Error(err, "the referenced pool could not be found")
-		return nil, nil, nil
+	pool, ok := selection.Object.(pooltypes.GenericInClusterPrefixPool)
+	if !ok {
+		return nil, nil, fmt.Errorf("selected pool %T is not a prefix pool", selection.Object)
 	}
 
+	h.pool = pool
+	h.poolRef = ipamv1.IPPoolReference{
+		APIGroup: v1alpha2.GroupVersion.Group,
+		Kind:     selection.Reference.Kind.Name,
+		Name:     selection.Reference.Name,
+	}
 	return h.pool, nil, nil
 }
 
 // EnsureAddress ensures that the IPAddress contains a valid prefix allocation.
 func (h *PrefixIPAddressClaimHandler) EnsureAddress(ctx context.Context, address *ipamv1.IPAddress) (*ctrl.Result, error) {
-	addressesInUse, err := poolutil.ListAddressesInUse(ctx, h.Client, h.pool.GetNamespace(), h.claim.Spec.PoolRef)
+	addressesInUse, err := poolutil.ListAddressesInUse(ctx, h.Client, h.pool.GetNamespace(), h.poolRef)
 	if err != nil {
 		return nil, fmt.Errorf("failed to list addresses: %w", err)
 	}
@@ -126,6 +137,14 @@ func (h *PrefixIPAddressClaimHandler) EnsureAddress(ctx context.Context, address
 
 		freePrefix, err := poolutil.FindFreePrefix(poolutil.NewPrefixPoolConfig(poolSpec), inUseIPSet)
 		if err != nil {
+			if errors.Is(err, poolutil.ErrNoPrefixAvailable) {
+				h.selectionErr = &poolselect.Error{
+					Kind:    poolselect.ErrPoolExhausted,
+					Message: fmt.Sprintf("selected pool %s %q has no free prefix", h.pool.GetObjectKind().GroupVersionKind().Kind, h.pool.GetName()),
+					Cause:   err,
+				}
+				return nil, h.selectionErr
+			}
 			return nil, fmt.Errorf("failed to find free prefix: %w", err)
 		}
 
@@ -140,6 +159,11 @@ func (h *PrefixIPAddressClaimHandler) EnsureAddress(ctx context.Context, address
 func (h *PrefixIPAddressClaimHandler) ReleaseAddress(_ context.Context) (*ctrl.Result, error) {
 	// We don't need to do anything here, since the prefix is released when the IPAddress is deleted.
 	return nil, nil
+}
+
+// SelectionError reports the classified pool selection failure, if any.
+func (h *PrefixIPAddressClaimHandler) SelectionError() (string, string) {
+	return selectionErrorReason(h.selectionErr)
 }
 
 func prefixPoolStatus(o client.Object) *v1alpha2.InClusterPrefixPoolStatusAddresses {

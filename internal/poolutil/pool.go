@@ -33,6 +33,11 @@ import (
 	"sigs.k8s.io/cluster-api-ipam-provider-in-cluster/internal/index"
 )
 
+// ErrNoAddressAvailable is returned by [FindFreeAddress] when the pool has no
+// address left to allocate. Callers can use errors.Is to distinguish
+// exhaustion from other allocation failures.
+var ErrNoAddressAvailable = errors.New("no address available")
+
 // AddressesOutOfRangeIPSet returns an IPSet of the inUseAddresses IPs that are
 // not in the poolIPSet.
 func AddressesOutOfRangeIPSet(inUseAddresses []ipamv1.IPAddress, poolIPSet *netipx.IPSet) (*netipx.IPSet, error) {
@@ -89,7 +94,7 @@ func FindFreeAddress(poolIPSet *netipx.IPSet, inUseIPSet *netipx.IPSet) (netip.A
 			ip = ip.Next()
 		}
 	}
-	return netip.Addr{}, errors.New("no address available")
+	return netip.Addr{}, ErrNoAddressAvailable
 }
 
 // PoolSpecToIPSet converts a pool spec to an IPSet. Reserved addresses will be

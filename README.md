@@ -26,6 +26,90 @@ This provider comes with two resource pairs:
 
 Within each pair, the resources are functionally identical aside from scope. The address-pool examples below use `InClusterIPPool`, but also apply to `GlobalInClusterIPPool`.
 
+### How a claim chooses its pool
+
+A claim refers to a pool in one of two ways. The decision rules live in one
+place, `internal/poolselect`, and both the implementation and callers follow the
+same rules.
+
+**Explicit reference.** `spec.poolRef.kind` and `spec.poolRef.name` name exactly
+one pool. The `kind` distinguishes the category (address vs. prefix) and the
+scope (namespaced vs. cluster-wide), so a namespaced and a cluster-wide pool may
+share a name without being confused. A namespaced pool is only looked up in the
+claim's own namespace. An explicit reference never falls back to another pool:
+if the named pool does not exist, the claim reports `PoolNotFound` and no
+address is allocated. A pool that is being deleted is reported as
+`PoolTerminating` rather than skipped.
+
+```yaml
+spec:
+  poolRef:
+    apiGroup: ipam.cluster.x-k8s.io
+    kind: GlobalInClusterIPPool
+    name: inclusterippool-sample
+```
+
+**Label selector.** Set `spec.poolRef.name` to the reserved value
+`pool-selector` and put a label selector on the
+`ipam.cluster.x-k8s.io/pool-selector` annotation. The `kind` still fixes the
+category; the scope is chosen by the rules below.
+
+```yaml
+metadata:
+  annotations:
+    ipam.cluster.x-k8s.io/pool-selector: '{"matchLabels":{"env":"prod"}}'
+spec:
+  poolRef:
+    apiGroup: ipam.cluster.x-k8s.io
+    kind: InClusterIPPool
+    name: pool-selector
+```
+
+Selector rules, in order:
+
+1. Only pools of the reference's category (address or prefix) that match the
+   selector are considered.
+2. A namespaced pool in the claim's namespace takes precedence over any
+   cluster-wide pool.
+3. If more than one pool matches at the preferred level, the reference is
+   ambiguous (`Ambiguous`) and no pool is chosen. A pool is never picked
+   arbitrarily.
+4. If nothing matches, the claim reports `PoolNotFound`. There is no implicit
+   default pool.
+
+Within one category, an explicit `name` always wins over a selector carried by
+the same reference.
+
+**Capacity is not part of selection.** An exhausted pool still wins the
+selection and the claim reports `PoolExhausted`; it does not spill over into a
+pool with free space. This keeps addresses inside the network range the
+reference asked for.
+
+**Pools being deleted** take part in matching so a label-selected claim cannot
+silently move to a different range; once such a pool wins the selection the
+claim reports `PoolTerminating`.
+
+### Existing allocations and label changes
+
+An already allocated `IPAddress` records the pool it came from in
+`spec.poolRef`. That recorded reference is authoritative: when a claim is
+reconciled again, the allocation is pinned to the pool recorded on the address,
+even if labels, selectors or the rules have changed. Pool labels changed at
+runtime therefore affect new claims only; existing allocations are never
+migrated. If the recorded pool has since been deleted, the allocation is kept
+and the claim reports `ExistingPoolMissing` instead of selecting a new pool.
+Claims allocated before this behaviour existed already carry the pool in
+`spec.poolRef`, so they are recognised without migration.
+
+### Changing a pool's addresses or prefix
+
+Allocations are not migrated when a pool's `spec.addresses` or `spec.prefix`
+changes. An address that is still inside the new range is kept as-is. An address
+that falls outside is still kept, but it is counted in the pool's
+`status.ipAddresses.outOfRange` so operators can handle it. This matches the
+admission webhook, which rejects an update that would remove an in-use address
+from the pool.
+
 A simple pool that covers an entire /24 IPv4 network could look like this:
 
 ```yaml

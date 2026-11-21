@@ -1,0 +1,14 @@
+apiVersion: ipam.cluster.x-k8s.io/v1beta1
+kind: IPAddressClaim
+metadata:
+  name: my-selector-claim
+  annotations:
+    # Selects a pool by label. Namespaced pools in this namespace win over
+    # cluster-wide pools; more than one match at the winning level is an error.
+    ipam.cluster.x-k8s.io/pool-selector: '{"matchLabels":{"env":"prod"}}'
+spec:
+  poolRef:
+    apiGroup: ipam.cluster.x-k8s.io
+    kind: InClusterIPPool
+    # "pool-selector" is the reserved marker for a label-selector reference.
+    name: pool-selector

@@ -34,13 +34,14 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 
 	"sigs.k8s.io/cluster-api-ipam-provider-in-cluster/api/v1alpha2"
+	"sigs.k8s.io/cluster-api-ipam-provider-in-cluster/internal/poolselect"
 	"sigs.k8s.io/cluster-api-ipam-provider-in-cluster/internal/poolutil"
 	pooltypes "sigs.k8s.io/cluster-api-ipam-provider-in-cluster/pkg/types"
 )
 
 const (
-	inClusterIPPoolKind       = "InClusterIPPool"
-	globalInClusterIPPoolKind = "GlobalInClusterIPPool"
+	inClusterIPPoolKind       = poolselect.KindInClusterIPPool
+	globalInClusterIPPoolKind = poolselect.KindGlobalInClusterIPPool
 
 	// ProtectPoolFinalizer is used to prevent deletion of a Pool object while its addresses have not been deleted.
 	ProtectPoolFinalizer = "ipam.cluster.x-k8s.io/ProtectPool"

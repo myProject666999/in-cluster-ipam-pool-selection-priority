@@ -7,6 +7,7 @@ import (
 
 	"github.com/pkg/errors"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
 	kerrors "k8s.io/apimachinery/pkg/util/errors"
@@ -15,6 +16,7 @@ import (
 	ipamv1 "sigs.k8s.io/cluster-api/api/ipam/v1beta2"
 	clusterutil "sigs.k8s.io/cluster-api/util"
 	"sigs.k8s.io/cluster-api/util/annotations"
+	"sigs.k8s.io/cluster-api/util/conditions"
 	"sigs.k8s.io/cluster-api/util/patch"
 	"sigs.k8s.io/cluster-api/util/predicates"
 	ctrl "sigs.k8s.io/controller-runtime"
@@ -25,6 +27,8 @@ import (
 	ctrlhandler "sigs.k8s.io/controller-runtime/pkg/handler"
 	"sigs.k8s.io/controller-runtime/pkg/predicate"
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
+
+	"sigs.k8s.io/cluster-api-ipam-provider-in-cluster/internal/poolselect"
 )
 
 const (
@@ -80,6 +84,17 @@ type ClaimHandler interface {
 	// It will be called even if FetchPool was not successful when reconciling a deleted claim, so there is no guarantee
 	// that the claim is available in the handler.
 	ReleaseAddress(ctx context.Context) (*ctrl.Result, error)
+}
+
+// SelectionErrorReporter is an optional extension of [ClaimHandler]. A handler
+// that implements it can explain why it declined to select a pool, so the
+// reason can be reported on the claim's Ready condition instead of retrying.
+type SelectionErrorReporter interface {
+	// SelectionError returns a stable reason and a human readable message if
+	// the claim's pool could not be selected or the selected pool could not
+	// satisfy the claim. Returning an empty reason means there is nothing to
+	// report.
+	SelectionError() (reason string, message string)
 }
 
 // SetupWithManager sets up the controller with the Manager.
@@ -193,15 +208,21 @@ func (r *ClaimReconciler) Reconcile(ctx context.Context, req ctrl.Request) (_ ct
 			if !claim.ObjectMeta.DeletionTimestamp.IsZero() {
 				return r.reconcileDelete(ctx, claim, handler)
 			}
+			r.reportSelection(claim, handler)
 			return ctrl.Result{}, nil
 		}
 		return ctrl.Result{}, errors.Wrap(err, "failed to fetch pool")
 	}
 
 	if pool == nil {
-		err = fmt.Errorf("pool is nil")
-		log.Error(err, "pool error")
-		return ctrl.Result{}, errors.Wrap(err, "reconciliation failed")
+		// The handler declined to select a pool. That is a decision, not a
+		// transient failure: report it on the claim status instead of retrying
+		// in a tight loop, and never silently fall back to another pool.
+		if !claim.ObjectMeta.DeletionTimestamp.IsZero() {
+			return r.reconcileDelete(ctx, claim, handler)
+		}
+		r.reportSelection(claim, handler)
+		return ctrl.Result{}, nil
 	}
 
 	if annotations.HasPaused(pool) {
@@ -241,6 +262,13 @@ func (r *ClaimReconciler) Reconcile(ctx context.Context, req ctrl.Request) (_ ct
 
 	if res != nil || err != nil {
 		if err != nil {
+			// Exhaustion is not a transient error: the selected pool is right,
+			// it is simply full. Report it on the claim instead of retrying.
+			var exhausted *poolselect.Error
+			if errors.As(err, &exhausted) && exhausted.Kind == poolselect.ErrPoolExhausted {
+				r.reportSelection(claim, handler)
+				return ctrl.Result{}, nil
+			}
 			err = errors.Wrap(err, "failed to create or patch address")
 		}
 		return unwrapResult(res), err
@@ -273,8 +301,35 @@ func (r *ClaimReconciler) Reconcile(ctx context.Context, req ctrl.Request) (_ ct
 	}
 
 	claim.Status.AddressRef = ipamv1.IPAddressReference{Name: address.Name}
+	// Clear a selection failure recorded on an earlier reconcile now that the
+	// claim has an address, so the condition reflects the current state.
+	conditions.Set(claim, metav1.Condition{
+		Type:   ipamv1.IPAddressClaimReadyCondition,
+		Status: metav1.ConditionTrue,
+		Reason: "Allocated",
+	})
 
 	return ctrl.Result{}, nil
+}
+
+// reportSelection records the handler's classified selection outcome on the
+// claim's Ready condition. It deliberately leaves a successful claim's status
+// untouched and never allocates anything.
+func (r *ClaimReconciler) reportSelection(claim *ipamv1.IPAddressClaim, handler ClaimHandler) {
+	reporter, ok := handler.(SelectionErrorReporter)
+	if !ok {
+		return
+	}
+	reason, message := reporter.SelectionError()
+	if reason == "" {
+		return
+	}
+	conditions.Set(claim, metav1.Condition{
+		Type:    ipamv1.IPAddressClaimReadyCondition,
+		Status:  metav1.ConditionFalse,
+		Reason:  reason,
+		Message: message,
+	})
 }
 
 func (r *ClaimReconciler) reconcileDelete(ctx context.Context, claim *ipamv1.IPAddressClaim, handler ClaimHandler) (ctrl.Result, error) {
